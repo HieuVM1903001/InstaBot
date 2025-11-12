@@ -204,6 +204,9 @@ class Controller:
 
         def select_palette(idx):
             nonlocal prev_palette_idx
+            # Check stop flag before selecting palette
+            if self._stop_flag.is_set():
+                return False
             if idx is not None and idx != prev_palette_idx and idx < len(self.palette_positions):
                 px, py = self.palette_positions[idx]
                 if self.dry_run:
@@ -218,6 +221,7 @@ class Controller:
                         self.mouse.click(Button.left, 1)
                     time.sleep(max(0.002, self.move_delay))
                 prev_palette_idx = idx
+            return True
 
         print("=== DRAWING STARTED ===")
 
@@ -242,7 +246,8 @@ class Controller:
                                 palette_idx = palette.index(nearest)
                             except ValueError:
                                 palette_idx = None
-                    select_palette(palette_idx)
+                    if not select_palette(palette_idx):
+                        return
                     for path in region.get('paths', []):
                         if not path:
                             continue
