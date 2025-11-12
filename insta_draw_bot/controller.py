@@ -283,11 +283,12 @@ class Controller:
                         time.sleep(FILL_GAP)
 
             # strokes
-            # choose stroke mode: 'drag' = continuous drag, 'click' = per-point clicks
+            # choose stroke mode: 'drag' = continuous drag, 'click' = per-point clicks, 'none' = skip strokes (fill only)
             total_actions = 0
-            for stroke in strokes_norm:
-                # each stroke counts as 1 action if drag, or len(points) if click
-                total_actions += 1 if self.stroke_mode == "drag" else max(1, len(stroke))
+            if self.stroke_mode != "none":
+                for stroke in strokes_norm:
+                    # each stroke counts as 1 action if drag, or len(points) if click
+                    total_actions += 1 if self.stroke_mode == "drag" else max(1, len(stroke))
             # add fill paths count
             for region in fill_regions:
                 for path in region.get('paths', []):
@@ -295,70 +296,72 @@ class Controller:
 
             action_done = 0
 
-            for stroke in strokes_norm:
-                if self._stop_flag.is_set():
-                    print("Stopped mid-stroke.")
-                    return
-                if len(stroke) < 1:
-                    continue
-                # choose color for this stroke
-                color = sample_img_color(stroke[0][0], stroke[0][1])
-                nearest = utils.find_nearest_color(color, palette, prev_idx=prev_palette_idx)
-                palette_idx = palette.index(nearest) if nearest in palette else None
-                select_palette(palette_idx)
+            # draw strokes (skip if stroke_mode is "none")
+            if self.stroke_mode != "none":
+                for stroke in strokes_norm:
+                    if self._stop_flag.is_set():
+                        print("Stopped mid-stroke.")
+                        return
+                    if len(stroke) < 1:
+                        continue
+                    # choose color for this stroke
+                    color = sample_img_color(stroke[0][0], stroke[0][1])
+                    nearest = utils.find_nearest_color(color, palette, prev_idx=prev_palette_idx)
+                    palette_idx = palette.index(nearest) if nearest in palette else None
+                    select_palette(palette_idx)
 
-                pts_screen = [to_screen(p[0], p[1]) for p in stroke]
-                # interpolate for smooth lines
-                pts_smooth = interpolate_points(pts_screen, self.pen_size)
-                
-                if self.dry_run:
-                    pts_preview = pts_smooth[:8]
-                    print(f"[DRY] stroke (drag) sample: {pts_preview}")
-                    continue
+                    pts_screen = [to_screen(p[0], p[1]) for p in stroke]
+                    # interpolate for smooth lines
+                    pts_smooth = interpolate_points(pts_screen, self.pen_size)
+                    
+                    if self.dry_run:
+                        pts_preview = pts_smooth[:8]
+                        print(f"[DRY] stroke (drag) sample: {pts_preview}")
+                        continue
 
-                if len(pts_smooth) == 1:
-                    x, y = pts_smooth[0]
+                    if len(pts_smooth) == 1:
+                        x, y = pts_smooth[0]
+                        try:
+                            pyautogui.click(int(x), int(y))
+                        except Exception:
+                            self.mouse.position = (int(x), int(y))
+                            self.mouse.click(Button.left, 1)
+                        time.sleep(STROKE_GAP)
+                        continue
+
+                    # perform a continuous drag along the stroke with interpolated smooth points
                     try:
-                        pyautogui.click(int(x), int(y))
+                        sx, sy = pts_smooth[0]
+                        pyautogui.moveTo(int(sx), int(sy))
+                        pyautogui.mouseDown(button='left')
+                        for x, y in pts_smooth[1:]:
+                            if self._stop_flag.is_set():
+                                pyautogui.mouseUp(button='left')
+                                return
+                            # compute duration proportional to distance
+                            import math
+
+                            dx = int(x) - pyautogui.position().x
+                            dy = int(y) - pyautogui.position().y
+                            dist = math.hypot(dx, dy)
+                            duration = max(MOVE_DELAY, dist / (800.0 * self.speed))
+                            pyautogui.dragTo(int(x), int(y), duration=duration, button='left')
+                        pyautogui.mouseUp(button='left')
                     except Exception:
-                        self.mouse.position = (int(x), int(y))
-                        self.mouse.click(Button.left, 1)
+                        # fallback to clicking smooth interpolated points
+                        for x, y in pts_smooth:
+                            if self._stop_flag.is_set():
+                                return
+                            self.mouse.position = (x, y)
+                            self.mouse.click(Button.left, 1)
+                            time.sleep(max(0.001, MOVE_DELAY * 0.3))
+                    # mark action complete(s)
+                    action_done += 1 if self.stroke_mode == "drag" else max(1, len(pts_screen))
+                    # print progress
+                    pct = int(100.0 * action_done / max(1, total_actions))
+                    bar = ('#' * (pct // 2)).ljust(50)
+                    print(f"Progress: |{bar}| {pct}% ({action_done}/{total_actions})", end='\r')
                     time.sleep(STROKE_GAP)
-                    continue
-
-                # perform a continuous drag along the stroke with interpolated smooth points
-                try:
-                    sx, sy = pts_smooth[0]
-                    pyautogui.moveTo(int(sx), int(sy))
-                    pyautogui.mouseDown(button='left')
-                    for x, y in pts_smooth[1:]:
-                        if self._stop_flag.is_set():
-                            pyautogui.mouseUp(button='left')
-                            return
-                        # compute duration proportional to distance
-                        import math
-
-                        dx = int(x) - pyautogui.position().x
-                        dy = int(y) - pyautogui.position().y
-                        dist = math.hypot(dx, dy)
-                        duration = max(MOVE_DELAY, dist / (800.0 * self.speed))
-                        pyautogui.dragTo(int(x), int(y), duration=duration, button='left')
-                    pyautogui.mouseUp(button='left')
-                except Exception:
-                    # fallback to clicking smooth interpolated points
-                    for x, y in pts_smooth:
-                        if self._stop_flag.is_set():
-                            return
-                        self.mouse.position = (x, y)
-                        self.mouse.click(Button.left, 1)
-                        time.sleep(max(0.001, MOVE_DELAY * 0.3))
-                # mark action complete(s)
-                action_done += 1 if self.stroke_mode == "drag" else max(1, len(pts_screen))
-                # print progress
-                pct = int(100.0 * action_done / max(1, total_actions))
-                bar = ('#' * (pct // 2)).ljust(50)
-                print(f"Progress: |{bar}| {pct}% ({action_done}/{total_actions})", end='\r')
-                time.sleep(STROKE_GAP)
 
             # dots
             # for d in dots_norm:
