@@ -69,7 +69,7 @@ class Controller:
     def start_listeners(self):
         self.mouse_listener.start()
         self.keyboard_listener.start()
-        print("Listeners started. 's' = canvas, 'f' = color, 'p' = draw, Esc = stop.")
+        print("Listeners started. 's' = canvas, 'f' = color, 'p' = draw, 'e' = stop.")
 
     def _on_click(self, x, y, button, pressed):
         if not pressed:
@@ -122,7 +122,7 @@ class Controller:
                 self._draw_thread = threading.Thread(target=self._run_drawing)
                 self._draw_thread.start()
             return
-        if key == keyboard.Key.esc:
+        if ch and ch.lower() == "e":
             print("Stopping drawing...")
             self._stop_flag.set()
             return
