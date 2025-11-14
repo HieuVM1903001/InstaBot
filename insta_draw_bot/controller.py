@@ -19,6 +19,7 @@ class Controller:
         pen_size: float = 1.0,
         fill_mode: str = "contour",
         stroke_mode: str = "drag",
+        fill_only: bool = False,
         initial_bbox: Optional[Tuple[int, int, int, int]] = None,
         initial_palette_positions: Optional[List[Tuple[int, int]]] = None,
         initial_palette_colors: Optional[List[Tuple[int, int, int]]] = None,
@@ -30,6 +31,7 @@ class Controller:
         self.pen_size = max(0.1, float(pen_size))
         self.fill_mode = fill_mode or "none"
         self.stroke_mode = (stroke_mode or "drag").lower()
+        self.fill_only = bool(fill_only)
 
         self.bbox = None
         self._waiting_bbox = False
@@ -38,6 +40,10 @@ class Controller:
         self.palette_colors = []
         self._stop_flag = threading.Event()
         self._draw_thread = None
+
+        # Progress tracking
+        self.total_operations = 0
+        self.completed_operations = 0
 
         # Real mouse controller
         self.mouse = MouseController()
@@ -52,7 +58,8 @@ class Controller:
             pyautogui.FAILSAFE = False
         except Exception:
             pass
-        # apply initial config if provided
+        
+        # Apply initial config if provided
         if initial_bbox:
             try:
                 self.bbox = tuple(int(v) for v in initial_bbox)
@@ -100,7 +107,7 @@ class Controller:
             ch = key.char
         except AttributeError:
             ch = None
-        # toggle bbox selection on 's' (lower or upper)
+        
         if ch and ch.lower() == "s":
             if not self._waiting_bbox:
                 self._waiting_bbox = True
@@ -111,7 +118,6 @@ class Controller:
             print("Click a color point to sample it.")
             self._waiting_color_click = True
             return
-        # start drawing on 'p' key
         if ch and ch.lower() == "p":
             if self.bbox is None:
                 print("No bounding box set!")
@@ -123,12 +129,91 @@ class Controller:
                 self._draw_thread.start()
             return
         if ch and ch.lower() == "e":
-            print("Stopping drawing...")
+            print("Stopping drawing... Press 'r' to resume.")
             self._stop_flag.set()
             return
+        if ch and ch.lower() == "r":
+            if self._draw_thread is not None and self._draw_thread.is_alive():
+                print("Resuming drawing...")
+                self._stop_flag.clear()
+            return
+
+    def _update_progress(self, message: str = ""):
+        """Update and display progress bar."""
+        if self.total_operations == 0:
+            return
+        
+        progress = (self.completed_operations / self.total_operations) * 100
+        bar_length = 50
+        filled = int(bar_length * self.completed_operations / self.total_operations)
+        bar = '█' * filled + '░' * (bar_length - filled)
+        
+        print(f'\r[{bar}] {progress:.1f}% {message} ({self.completed_operations}/{self.total_operations})', end='', flush=True)
+        
+        if self.completed_operations >= self.total_operations:
+            print()  # New line when complete
+
+    def _draw_path(self, points: List[Tuple[int, int]], delay_mult: float = 1.0):
+        """Draw a path using the current stroke mode."""
+        if not points or self._stop_flag.is_set():
+            return
+        
+        if len(points) == 1:
+            # Single point - just click
+            x, y = points[0]
+            try:
+                pyautogui.click(int(x), int(y))
+            except Exception:
+                self.mouse.position = (int(x), int(y))
+                self.mouse.click(Button.left, 1)
+            time.sleep(max(0.001, self.move_delay * delay_mult))
+            return
+        
+        # Multiple points - use stroke mode
+        if self.stroke_mode == "drag":
+            # Drag mode: continuous drag
+            try:
+                sx, sy = points[0]
+                pyautogui.moveTo(int(sx), int(sy))
+                pyautogui.mouseDown(button='left')
+                
+                for x, y in points[1:]:
+                    if self._stop_flag.is_set():
+                        pyautogui.mouseUp(button='left')
+                        return
+                    
+                    # Calculate duration based on distance and speed
+                    dx = int(x) - pyautogui.position().x
+                    dy = int(y) - pyautogui.position().y
+                    dist = (dx*dx + dy*dy) ** 0.5
+                    
+                    # Speed-aware duration: pixels per second = 800 * speed
+                    duration = max(self.move_delay, dist / (800.0 * self.speed))
+                    pyautogui.dragTo(int(x), int(y), duration=duration, button='left')
+                
+                pyautogui.mouseUp(button='left')
+            except Exception:
+                # Fallback to click mode
+                for x, y in points:
+                    if self._stop_flag.is_set():
+                        return
+                    self.mouse.position = (int(x), int(y))
+                    self.mouse.click(Button.left, 1)
+                    time.sleep(max(0.001, self.move_delay * 0.3 * delay_mult))
+        else:
+            # Click mode: click each point
+            for x, y in points:
+                if self._stop_flag.is_set():
+                    return
+                try:
+                    pyautogui.click(int(x), int(y))
+                except Exception:
+                    self.mouse.position = (int(x), int(y))
+                    self.mouse.click(Button.left, 1)
+                time.sleep(max(0.001, self.move_delay * 0.3 * delay_mult))
 
     def _run_drawing(self):
-        # ensure bbox
+        """Main drawing loop with progress tracking and fill support."""
         if not self.bbox:
             print("No bounding box defined!")
             return
@@ -141,70 +226,65 @@ class Controller:
         img, offset = image_processing.load_and_fit_image(self.image_path, w, h)
         off_x, off_y = offset
 
-        strokes_px = image_processing.edges_to_strokes(img)
-        dots_px = image_processing.dots_from_image(img, grid=12, threshold=140)
-        strokes_norm = image_processing.map_strokes_to_normalized(strokes_px, img.size[0], img.size[1])
-        dots_norm = image_processing.map_points_to_normalized(dots_px, img.size[0], img.size[1])
+        # Get strokes for outlines (only if not fill_only)
+        strokes_norm = []
+        if not self.fill_only:
+            strokes_px = image_processing.edges_to_strokes(img)
+            strokes_norm = image_processing.map_strokes_to_normalized(strokes_px, img.size[0], img.size[1])
 
-        fill_regions = []
-        # generate fill paths for selected fill mode (skip if fill_mode == "none")
-        if self.fill_mode != "none" and self.palette_colors:
-            spacing = max(2, int(round(8.0 / max(0.1, self.speed))))
-            fill_regions = image_processing.generate_fill_paths(img, self.palette_colors, mode=self.fill_mode, spacing=spacing)
+        # Get fill paths if fill mode is enabled
+        fill_data = []
+        if self.fill_mode and self.fill_mode != "none" and self.palette_colors:
+            print(f"Generating {self.fill_mode} fill patterns...")
+            # Speed-aware spacing: faster speed = larger spacing
+            spacing = max(2, int(8.0 / max(0.5, self.speed)))
+            fill_data = image_processing.generate_fill_paths(
+                img, 
+                self.palette_colors,
+                mode=self.fill_mode,
+                spacing=spacing,
+                min_area=50
+            )
+            print(f"Generated {len(fill_data)} color regions with fill patterns")
 
-        print(f"{len(strokes_norm)} strokes, {len(dots_norm)} dots")
-
-        # compute total actions for progress bar (fill paths + stroke actions)
-        total_actions = 0
-        # fill paths count
-        for region in fill_regions:
-            total_actions += len(region.get('paths', []))
-        # strokes count depends on stroke_mode
+        # Calculate total operations for progress tracking
+        self.total_operations = 0
+        self.completed_operations = 0
+        
+        # Count fill path points
+        for region in fill_data:
+            for path in region['paths']:
+                if self.stroke_mode == "drag":
+                    self.total_operations += 1  # One drag per path
+                else:
+                    self.total_operations += len(path)  # One click per point
+        
+        # Count stroke points
         for stroke in strokes_norm:
-            total_actions += 1 if self.stroke_mode == "drag" else max(1, len(stroke))
-        action_done = 0
+            if self.stroke_mode == "drag":
+                self.total_operations += 1  # One drag per stroke
+            else:
+                self.total_operations += len(stroke)  # One click per point
+
+        print(f"Total operations: {self.total_operations}")
+        print(f"Mode: {'Fill only' if self.fill_only else 'Fill + Strokes'}, Stroke mode: {self.stroke_mode}")
 
         def to_screen(nx, ny):
             px = int(top_left_x + off_x + nx * img.size[0])
             py = int(top_left_y + off_y + ny * img.size[1])
             return px, py
 
-        def sample_img_color(nx, ny):
-            ix = int(min(max(0, nx * img.size[0]), img.size[0] - 1))
-            iy = int(min(max(0, ny * img.size[1]), img.size[1] - 1))
-            c = img.getpixel((ix, iy))
-            return (c[0], c[1], c[2])
-
-        def interpolate_points(points: List[Tuple[float, float]], pen_size: float) -> List[Tuple[float, float]]:
-            """Interpolate points to create smooth lines based on pen size."""
-            if len(points) < 2:
-                return points
-            # More interpolation points for smaller pen sizes to ensure smooth coverage
-            interp_steps = max(1, int(self.pen_size / 2.0))
-            result = [points[0]]
-            for i in range(1, len(points)):
-                x1, y1 = points[i - 1]
-                x2, y2 = points[i]
-                for step in range(1, interp_steps + 1):
-                    t = step / (interp_steps + 1)
-                    x = x1 + t * (x2 - x1)
-                    y = y1 + t * (y2 - y1)
-                    result.append((x, y))
-                result.append(points[i])
-            return result
-
-        # Faster delays: reduced minimums for snappier movement
-        MOVE_DELAY = max(0.001, 0.0005 / self.speed)
-        STROKE_GAP = max(0.002, 0.0015 / self.speed)
-        DOT_DELAY = max(0.0005, 0.0001 / self.speed)
-        FILL_GAP = max(0.001, 0.0008 / self.speed)
+        def to_screen_pixel(px, py):
+            """Convert pixel coordinates to screen coordinates."""
+            sx = int(top_left_x + off_x + px)
+            sy = int(top_left_y + off_y + py)
+            return sx, sy
 
         palette = list(self.palette_colors)
         prev_palette_idx = None
 
         def select_palette(idx):
             nonlocal prev_palette_idx
-            # Check stop flag before selecting palette
             if self._stop_flag.is_set():
                 return False
             if idx is not None and idx != prev_palette_idx and idx < len(self.palette_positions):
@@ -213,187 +293,141 @@ class Controller:
                     print(f"[DRY] Select color {idx}: {px},{py}")
                 else:
                     try:
-                        # use pyautogui for fast clicks
                         pyautogui.click(px, py)
                     except Exception:
-                        # fallback to pynput
                         self.mouse.position = (px, py)
                         self.mouse.click(Button.left, 1)
                     time.sleep(max(0.002, self.move_delay))
                 prev_palette_idx = idx
             return True
 
-        print("=== DRAWING STARTED ===")
+        print("\n=== DRAWING STARTED ===")
 
         try:
-            # Fill regions using the generated path families
-            if fill_regions:
-                for region in fill_regions:
+            # Draw fills first (background)
+            if fill_data:
+                print("\nDrawing fill patterns...")
+                for region in fill_data:
                     if self._stop_flag.is_set():
+                        print("\nStopped during fill.")
                         return
-                    color = region.get('color')
-                    try:
-                        palette_idx = palette.index(color)
-                    except ValueError:
-                        palette_idx = None
+                    
+                    color = region['color']
+                    paths = region['paths']
+                    
+                    # Find palette index for this color
+                    palette_idx = None
                     if palette:
-                        if palette_idx is None and region.get('paths'):
-                            # sample first point of first path to choose nearest palette entry
-                            p0 = region['paths'][0][0]
-                            col_sample = img.getpixel((p0[0], p0[1]))
-                            nearest = utils.find_nearest_color(col_sample, palette, prev_idx=prev_palette_idx)
+                        try:
+                            palette_idx = palette.index(color)
+                        except ValueError:
+                            # Find nearest color
+                            nearest = utils.find_nearest_color(color, palette, prev_palette_idx)
                             try:
                                 palette_idx = palette.index(nearest)
                             except ValueError:
                                 palette_idx = None
+                    
                     if not select_palette(palette_idx):
                         return
-                    for path in region.get('paths', []):
-                        if not path:
+                    
+                    # Draw each path in this region
+                    for path in paths:
+                        if self._stop_flag.is_set():
+                            return
+                        
+                        if len(path) == 0:
                             continue
-                        pts_screen = [to_screen(p[0] / img.size[0], p[1] / img.size[1]) for p in path]
-                        # interpolate for smooth lines
-                        pts_smooth = interpolate_points(pts_screen, self.pen_size)
+                        
                         if self.dry_run:
-                            print(f"[DRY] fill path sample: {pts_smooth[:6]}")
+                            print(f"[DRY] Fill path with {len(path)} points")
+                            if self.stroke_mode == "drag":
+                                self.completed_operations += 1
+                            else:
+                                self.completed_operations += len(path)
                             continue
-                        try:
-                            sx, sy = pts_smooth[0]
-                            pyautogui.moveTo(int(sx), int(sy))
-                            pyautogui.mouseDown(button='left')
-                            for x, y in pts_smooth[1:]:
-                                if self._stop_flag.is_set():
-                                    pyautogui.mouseUp(button='left')
-                                    return
-                                import math
+                        
+                        # Convert pixel coordinates to screen coordinates
+                        screen_points = [to_screen_pixel(pt[0], pt[1]) for pt in path]
+                        
+                        # Draw using current stroke mode
+                        self._draw_path(screen_points, delay_mult=0.8)
+                        
+                        # Update progress
+                        if self.stroke_mode == "drag":
+                            self.completed_operations += 1
+                        else:
+                            self.completed_operations += len(path)
+                        
+                        if self.completed_operations % 10 == 0:
+                            self._update_progress("- Filling")
 
-                                dx = int(x) - pyautogui.position().x
-                                dy = int(y) - pyautogui.position().y
-                                dist = math.hypot(dx, dy)
-                                duration = max(MOVE_DELAY, dist / (800.0 * self.speed))
-                                pyautogui.dragTo(int(x), int(y), duration=duration, button='left')
-                            pyautogui.mouseUp(button='left')
-                        except Exception:
-                            for x, y in pts_smooth:
-                                if self._stop_flag.is_set():
-                                    return
-                                self.mouse.position = (int(x), int(y))
-                                self.mouse.click(Button.left, 1)
-                                time.sleep(max(0.001, MOVE_DELAY * 0.3))
-                        time.sleep(FILL_GAP)
-
-            # strokes
-            # choose stroke mode: 'drag' = continuous drag, 'click' = per-point clicks, 'none' = skip strokes (fill only)
-            total_actions = 0
-            if self.stroke_mode != "none":
-                for stroke in strokes_norm:
-                    # each stroke counts as 1 action if drag, or len(points) if click
-                    total_actions += 1 if self.stroke_mode == "drag" else max(1, len(stroke))
-            # add fill paths count
-            for region in fill_regions:
-                for path in region.get('paths', []):
-                    total_actions += 1
-
-            action_done = 0
-
-            # draw strokes (skip if stroke_mode is "none")
-            if self.stroke_mode != "none":
-                for stroke in strokes_norm:
+            # Draw outlines/strokes on top (skip if fill_only)
+            if strokes_norm and not self.fill_only:
+                print("\nDrawing outlines...")
+                for stroke_idx, stroke in enumerate(strokes_norm):
                     if self._stop_flag.is_set():
-                        print("Stopped mid-stroke.")
+                        print("\nStopped mid-stroke.")
                         return
+                    
                     if len(stroke) < 1:
                         continue
-                    # choose color for this stroke
-                    color = sample_img_color(stroke[0][0], stroke[0][1])
-                    nearest = utils.find_nearest_color(color, palette, prev_idx=prev_palette_idx)
-                    palette_idx = palette.index(nearest) if nearest in palette else None
-                    select_palette(palette_idx)
-
-                    pts_screen = [to_screen(p[0], p[1]) for p in stroke]
-                    # interpolate for smooth lines
-                    pts_smooth = interpolate_points(pts_screen, self.pen_size)
                     
-                    if self.dry_run:
-                        pts_preview = pts_smooth[:8]
-                        print(f"[DRY] stroke (drag) sample: {pts_preview}")
-                        continue
-
-                    if len(pts_smooth) == 1:
-                        x, y = pts_smooth[0]
-                        try:
-                            pyautogui.click(int(x), int(y))
-                        except Exception:
-                            self.mouse.position = (int(x), int(y))
-                            self.mouse.click(Button.left, 1)
-                        time.sleep(STROKE_GAP)
-                        continue
-
-                    # perform a continuous drag along the stroke with interpolated smooth points
+                    # Sample color from first point of stroke
+                    img_x = int(stroke[0][0] * img.size[0])
+                    img_y = int(stroke[0][1] * img.size[1])
+                    img_x = max(0, min(img.size[0] - 1, img_x))
+                    img_y = max(0, min(img.size[1] - 1, img_y))
+                    
                     try:
-                        sx, sy = pts_smooth[0]
-                        pyautogui.moveTo(int(sx), int(sy))
-                        pyautogui.mouseDown(button='left')
-                        for x, y in pts_smooth[1:]:
-                            if self._stop_flag.is_set():
-                                pyautogui.mouseUp(button='left')
-                                return
-                            # compute duration proportional to distance
-                            import math
+                        c = img.getpixel((img_x, img_y))
+                        color = (c[0], c[1], c[2])
+                    except:
+                        color = (0, 0, 0)
+                    
+                    nearest = utils.find_nearest_color(color, palette, prev_palette_idx)
+                    palette_idx = palette.index(nearest) if nearest in palette else None
+                    
+                    if not select_palette(palette_idx):
+                        return
 
-                            dx = int(x) - pyautogui.position().x
-                            dy = int(y) - pyautogui.position().y
-                            dist = math.hypot(dx, dy)
-                            duration = max(MOVE_DELAY, dist / (800.0 * self.speed))
-                            pyautogui.dragTo(int(x), int(y), duration=duration, button='left')
-                        pyautogui.mouseUp(button='left')
-                    except Exception:
-                        # fallback to clicking smooth interpolated points
-                        for x, y in pts_smooth:
-                            if self._stop_flag.is_set():
-                                return
-                            self.mouse.position = (x, y)
-                            self.mouse.click(Button.left, 1)
-                            time.sleep(max(0.001, MOVE_DELAY * 0.3))
-                    # mark action complete(s)
-                    action_done += 1 if self.stroke_mode == "drag" else max(1, len(pts_screen))
-                    # print progress
-                    pct = int(100.0 * action_done / max(1, total_actions))
-                    bar = ('#' * (pct // 2)).ljust(50)
-                    print(f"Progress: |{bar}| {pct}% ({action_done}/{total_actions})", end='\r')
-                    time.sleep(STROKE_GAP)
+                    if self.dry_run:
+                        print(f"[DRY] stroke {stroke_idx}: {len(stroke)} points")
+                        if self.stroke_mode == "drag":
+                            self.completed_operations += 1
+                        else:
+                            self.completed_operations += len(stroke)
+                        continue
 
-            # dots
-            # for d in dots_norm:
-            #     if self._stop_flag.is_set():
-            #         print("Stopped during dots.")
-            #         return
-            #     color = sample_img_color(d[0], d[1])
-            #     nearest = utils.find_nearest_color(color, palette)
-            #     palette_idx = palette.index(nearest) if nearest in palette else None
-            #     select_palette(palette_idx)
-            #     x, y = to_screen(d[0], d[1])
-            #     if self.dry_run:
-            #         print(f"[DRY] dot at {x},{y}")
-            #     else:
-            #         self.mouse.position = (x, y)
-            #         time.sleep(0.0002)
-            #         self.mouse.press(Button.left)
-            #         time.sleep(0.002)
-            #         self.mouse.release(Button.left)
-            #         time.sleep(DOT_DELAY)
+                    # Convert normalized coordinates to screen coordinates
+                    screen_points = [to_screen(pt[0], pt[1]) for pt in stroke]
+                    
+                    # Draw using current stroke mode
+                    self._draw_path(screen_points, delay_mult=1.0)
+                    
+                    # Update progress
+                    if self.stroke_mode == "drag":
+                        self.completed_operations += 1
+                    else:
+                        self.completed_operations += len(stroke)
+                    
+                    if self.completed_operations % 10 == 0:
+                        self._update_progress("- Drawing strokes")
 
-            print("=== DRAWING COMPLETE ===")
-            # ensure progress bar line ends
-            print()
+            self._update_progress("- Complete!")
+            print("\n=== DRAWING COMPLETE ===")
 
         except Exception as e:
             import traceback
-            print("Error during drawing:", e)
+            print(f"\nError during drawing: {e}")
             traceback.print_exc()
         finally:
             try:
                 self.mouse.release(Button.left)
+            except Exception:
+                pass
+            try:
+                pyautogui.mouseUp(button='left')
             except Exception:
                 pass
 
@@ -405,6 +439,9 @@ class Controller:
             "palette_colors": self.palette_colors,
             "speed": self.speed,
             "move_delay": self.move_delay,
+            "fill_mode": self.fill_mode,
+            "stroke_mode": self.stroke_mode,
+            "fill_only": self.fill_only,
         }
         try:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from PIL import Image
 from typing import Tuple, List
+import math
 
 
 def load_and_fit_image(path: str, target_w: int, target_h: int) -> Tuple[Image.Image, Tuple[int, int]]:
@@ -74,13 +75,6 @@ def color_grid(pil_img: Image.Image, grid=12) -> List[Tuple[int, int, Tuple[int,
             cy = y + (y2 - y) // 2
             cells.append((cx, cy, (int(avg[0]), int(avg[1]), int(avg[2]))))
     return cells
-
-
-import cv2
-import numpy as np
-from PIL import Image
-from typing import Tuple, List
-import math
 
 
 def generate_fill_paths(pil_img: Image.Image, palette: List[Tuple[int, int, int]], 
@@ -180,7 +174,7 @@ def _generate_paths_for_mask(mask: np.ndarray, mode: str, spacing: int,
         return _generate_spiral_pattern(mask, spacing, w, h)
     
     else:  # contour (default)
-        return _generate_contour_pattern(mask, spacing, min_area=50)
+        return _generate_contour_fill(mask, spacing, min_area=50)
 
 
 def _generate_dot_pattern(mask: np.ndarray, spacing: int, w: int, h: int) -> List[List[Tuple[int, int]]]:
@@ -188,7 +182,7 @@ def _generate_dot_pattern(mask: np.ndarray, spacing: int, w: int, h: int) -> Lis
     paths = []
     for y in range(0, h, spacing):
         for x in range(0, w, spacing):
-            if mask[y, x] > 0:
+            if y < h and x < w and mask[y, x] > 0:
                 paths.append([(x, y)])
     return paths
 
@@ -219,21 +213,18 @@ def _generate_horizontal_hatch(mask: np.ndarray, spacing: int, w: int, h: int) -
     paths = []
     
     for y in range(0, h, spacing):
-        current_line = None
+        current_line = []
         
         for x in range(w):
             if mask[y, x] > 0:
-                if current_line is None:
-                    current_line = [(x, y)]
+                current_line.append((x, y))
             else:
-                if current_line is not None:
-                    current_line.append((x - 1, y))
+                if current_line and len(current_line) >= 2:
                     paths.append(current_line)
-                    current_line = None
+                current_line = []
         
         # Close line at edge
-        if current_line is not None:
-            current_line.append((w - 1, y))
+        if current_line and len(current_line) >= 2:
             paths.append(current_line)
     
     return paths
@@ -244,21 +235,18 @@ def _generate_vertical_hatch(mask: np.ndarray, spacing: int, w: int, h: int) -> 
     paths = []
     
     for x in range(0, w, spacing):
-        current_line = None
+        current_line = []
         
         for y in range(h):
             if mask[y, x] > 0:
-                if current_line is None:
-                    current_line = [(x, y)]
+                current_line.append((x, y))
             else:
-                if current_line is not None:
-                    current_line.append((x, y - 1))
+                if current_line and len(current_line) >= 2:
                     paths.append(current_line)
-                    current_line = None
+                current_line = []
         
         # Close line at edge
-        if current_line is not None:
-            current_line.append((x, h - 1))
+        if current_line and len(current_line) >= 2:
             paths.append(current_line)
     
     return paths
@@ -278,12 +266,12 @@ def _generate_diagonal_hatch(mask: np.ndarray, spacing: int, w: int, h: int) -> 
             y = offset - x
             if 0 <= y < h and mask[y, x] > 0:
                 line_points.append((x, y))
-            elif line_points:
-                paths.append([line_points[0], line_points[-1]])
+            elif line_points and len(line_points) >= 2:
+                paths.append(line_points)
                 line_points = []
         
-        if line_points:
-            paths.append([line_points[0], line_points[-1]])
+        if line_points and len(line_points) >= 2:
+            paths.append(line_points)
     
     # Backward diagonal (↙)
     for offset in range(-h, w, spacing):
@@ -293,12 +281,12 @@ def _generate_diagonal_hatch(mask: np.ndarray, spacing: int, w: int, h: int) -> 
             y = x - offset
             if 0 <= y < h and mask[y, x] > 0:
                 line_points.append((x, y))
-            elif line_points:
-                paths.append([line_points[0], line_points[-1]])
+            elif line_points and len(line_points) >= 2:
+                paths.append(line_points)
                 line_points = []
         
-        if line_points:
-            paths.append([line_points[0], line_points[-1]])
+        if line_points and len(line_points) >= 2:
+            paths.append(line_points)
     
     return paths
 
@@ -319,9 +307,8 @@ def _generate_wave_pattern(mask: np.ndarray, spacing: int, w: int, h: int) -> Li
             
             if mask[wave_y, x] > 0:
                 wave_points.append((x, wave_y))
-            elif wave_points:
-                if len(wave_points) > 3:  # Only keep substantial segments
-                    paths.append(wave_points)
+            elif wave_points and len(wave_points) > 3:
+                paths.append(wave_points)
                 wave_points = []
         
         if wave_points and len(wave_points) > 3:
@@ -372,7 +359,7 @@ def _generate_spiral_pattern(mask: np.ndarray, spacing: int, w: int, h: int) -> 
                     spiral_path.append((x, y))
                     visited[y, x] = True
         
-        if spiral_path:
+        if spiral_path and len(spiral_path) > 1:
             paths.append(spiral_path)
         
         layer += spacing
@@ -380,9 +367,31 @@ def _generate_spiral_pattern(mask: np.ndarray, spacing: int, w: int, h: int) -> 
     return paths
 
 
-def _generate_contour_pattern(mask: np.ndarray, spacing: int, min_area: int) -> List[List[Tuple[int, int]]]:
-    """Follow the edges/contours of regions."""
+def _generate_contour_fill(mask: np.ndarray, spacing: int, min_area: int) -> List[List[Tuple[int, int]]]:
+    """
+    Fill the entire masked region with horizontal scan lines.
+    This ensures complete coverage of all colored areas.
+    """
     paths = []
+    h, w = mask.shape
+    
+    # Generate horizontal fill lines across entire mask
+    for y in range(0, h, spacing):
+        current_line = []
+        
+        for x in range(w):
+            if mask[y, x] > 0:
+                current_line.append((x, y))
+            else:
+                if current_line and len(current_line) >= 2:
+                    paths.append(current_line)
+                current_line = []
+        
+        # Add line at edge if exists
+        if current_line and len(current_line) >= 2:
+            paths.append(current_line)
+    
+    # Also add contour outlines for definition
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     for contour in contours:
@@ -392,11 +401,8 @@ def _generate_contour_pattern(mask: np.ndarray, spacing: int, min_area: int) -> 
         
         points = [(int(p[0][0]), int(p[0][1])) for p in contour]
         if len(points) > 2:
-            # Break into segments for smoother drawing
-            segment_length = max(2, spacing // 2)
-            for i in range(0, len(points), segment_length):
-                end_idx = min(i + segment_length, len(points) - 1)
-                paths.append([points[i], points[end_idx]])
+            # Add the complete contour as a single path
+            paths.append(points)
     
     return paths
 

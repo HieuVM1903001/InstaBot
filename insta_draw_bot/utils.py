@@ -55,7 +55,8 @@ def _lab_distance(a_lab, b_lab):
     return math.sqrt((a_lab[0] - b_lab[0]) ** 2 + (a_lab[1] - b_lab[1]) ** 2 + (a_lab[2] - b_lab[2]) ** 2)
 
 
-def find_nearest_color(target: Tuple[int, int, int], palette: List[Tuple[int, int, int]], prev_idx: Optional[int] = None, stickiness: float = 0.2):
+def find_nearest_color(target: Tuple[int, int, int], palette: List[Tuple[int, int, int]], 
+                      prev_idx: Optional[int] = None, stickiness: float = 0.2):
     """
     Find the closest matching color in the palette to the target color.
     
@@ -91,3 +92,10 @@ def find_nearest_color(target: Tuple[int, int, int], palette: List[Tuple[int, in
             closest_color = palette_color
     
     return closest_color
+
+
+def color_distance(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> float:
+    """Simple Euclidean distance between two RGB colors."""
+    r1, g1, b1 = a
+    r2, g2, b2 = b
+    return math.sqrt((r1 - r2) ** 2 + (g1 - g2) ** 2 + (b1 - b2) ** 2)
